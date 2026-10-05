@@ -74,8 +74,60 @@ class CatalogService:
             raise ConflictError("只有待审阅材料可以作出决定")
         if decision == "rejected" and len(note.strip()) < 4:
             raise ValidationError("驳回时需要说明可执行的原因")
+        now = to_storage(self.clock.now())
         with transaction(immediate=True) as connection:
-            return CatalogRepository(connection).review_evidence(evidence_id, reviewer.strip(), decision, to_storage(self.clock.now()))
+            repository = CatalogRepository(connection)
+            reviewed = repository.review_evidence(evidence_id, reviewer.strip(), decision, now)
+            auto_dispute = None
+            if decision == "accepted" and reviewed["claim_scope_key"]:
+                auto_dispute = self._auto_freeze_conflict(repository, reviewed, reviewer.strip(), now)
+            result = dict(reviewed)
+            result["auto_dispute"] = auto_dispute
+            return result
+
+    def _auto_freeze_conflict(self, repository: CatalogRepository, evidence: dict, actor: str, now: str) -> dict | None:
+        """接受后同一用途/指标/人群存在相反结论时，自动建立/重开争议并冻结材料。"""
+        open_dispute = repository.open_dispute_by_scope(evidence["product_id"], evidence["claim_scope_key"])
+        if open_dispute is not None:
+            # 未决争议期间又接受了同范围材料：把它追加冻结进既有争议
+            self._attach_if_new(repository, open_dispute["id"], [evidence], actor, now)
+            return {"dispute_id": open_dispute["id"], "code": open_dispute["code"], "action": "attached",
+                    "frozen_evidence_ids": [evidence["id"]]}
+        conflicts = repository.accepted_claim_scopes_with_conflict(evidence["product_id"])
+        if not any(item["claim_scope_key"] == evidence["claim_scope_key"] for item in conflicts):
+            return None
+        claims = [
+            item for item in repository.claims_in_scope(evidence["product_id"], evidence["claim_scope_key"])
+            if item["status"] == "accepted"
+        ]
+        latest = repository.latest_dispute_by_scope(evidence["product_id"], evidence["claim_scope_key"])
+        if latest is not None and latest["status"] == "resolved":
+            # 新的相反材料使冲突再次成立：重开原争议，保留完整裁决历史
+            repository.reopen_dispute(latest["id"], f"新的相反结论材料 #{evidence['id']} 经审阅接受，自动重开", now)
+            repository.supersede_current_ruling(latest["id"], now)
+            self._attach_if_new(repository, latest["id"], claims, actor, now)
+            return {"dispute_id": latest["id"], "code": latest["code"], "action": "reopened",
+                    "frozen_evidence_ids": [item["id"] for item in claims]}
+        sequence = int(repository.connection.execute(
+            "SELECT COUNT(*) FROM evidence_disputes WHERE product_id=? AND scope_key=?",
+            (evidence["product_id"], evidence["claim_scope_key"]),
+        ).fetchone()[0]) + 1
+        code = f"DSP-auto-{evidence['product_id']}-{evidence['claim_scope_key'][:8]}-{sequence}"
+        dispute = repository.create_dispute(
+            code=code, product_id=evidence["product_id"],
+            use=evidence["claim_use"], metric=evidence["claim_metric"], population=evidence["claim_population"],
+            scope_key=evidence["claim_scope_key"], opened_by=actor, dedupe_key=None, now=now,
+        )
+        self._attach_if_new(repository, dispute["id"], claims, actor, now)
+        return {"dispute_id": dispute["id"], "code": dispute["code"], "action": "opened",
+                "frozen_evidence_ids": [item["id"] for item in claims]}
+
+    @staticmethod
+    def _attach_if_new(repository: CatalogRepository, dispute_id: int, materials: list[dict], actor: str, now: str) -> None:
+        for item in materials:
+            if repository.material_prior_status(dispute_id, item["id"]) is None:
+                repository.attach_material(dispute_id, item["id"], item["status"], actor, now)
+            repository.set_evidence_status(item["id"], "disputed")
 
     def list_evidence(self, product_code: str | None, status: str | None) -> list[dict]:
         product_id = None

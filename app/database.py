@@ -168,13 +168,64 @@ CREATE TABLE IF NOT EXISTS evidence_documents (
     version TEXT NOT NULL,
     content_digest TEXT NOT NULL,
     summary_json TEXT NOT NULL DEFAULT '{}',
-    status TEXT NOT NULL DEFAULT 'submitted' CHECK(status IN ('submitted','accepted','rejected','superseded')),
+    status TEXT NOT NULL DEFAULT 'submitted' CHECK(status IN ('submitted','accepted','rejected','superseded','disputed')),
     submitted_by TEXT NOT NULL,
     submitted_at TEXT NOT NULL,
     reviewed_by TEXT,
     reviewed_at TEXT,
+    claim_use TEXT,
+    claim_metric TEXT,
+    claim_population TEXT,
+    claim_conclusion TEXT CHECK(claim_conclusion IS NULL OR claim_conclusion IN ('supports','concern')),
+    claim_scope_key TEXT,
     UNIQUE(product_id, evidence_type, version, content_digest)
 );
+CREATE TABLE IF NOT EXISTS evidence_disputes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    product_id INTEGER NOT NULL REFERENCES health_products(id) ON DELETE CASCADE,
+    claim_use TEXT NOT NULL,
+    claim_metric TEXT NOT NULL,
+    claim_population TEXT NOT NULL,
+    scope_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','resolved')),
+    opened_by TEXT NOT NULL,
+    dedupe_key TEXT,
+    opened_at TEXT NOT NULL,
+    resolved_at TEXT,
+    reopen_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dispute_open_scope ON evidence_disputes(product_id,scope_key) WHERE status='open';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dispute_dedupe ON evidence_disputes(dedupe_key) WHERE dedupe_key IS NOT NULL AND status='open';
+CREATE TABLE IF NOT EXISTS evidence_dispute_materials (
+    dispute_id INTEGER NOT NULL REFERENCES evidence_disputes(id) ON DELETE CASCADE,
+    evidence_id INTEGER NOT NULL REFERENCES evidence_documents(id) ON DELETE CASCADE,
+    prior_status TEXT,
+    added_by TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY(dispute_id, evidence_id)
+);
+CREATE TABLE IF NOT EXISTS evidence_dispute_rulings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dispute_id INTEGER NOT NULL REFERENCES evidence_disputes(id) ON DELETE CASCADE,
+    revision_no INTEGER NOT NULL,
+    adjudicator TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK(decision IN ('prefer_supports','prefer_concern','inconclusive','restricted_use')),
+    comparison_basis TEXT NOT NULL,
+    applicable_scope_json TEXT NOT NULL DEFAULT '{}',
+    interim_restrictions_json TEXT NOT NULL DEFAULT '[]',
+    is_final INTEGER NOT NULL DEFAULT 0 CHECK(is_final IN (0,1)),
+    is_current INTEGER NOT NULL DEFAULT 1 CHECK(is_current IN (0,1)),
+    idempotency_key TEXT,
+    superseded_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(dispute_id, revision_no),
+    UNIQUE(dispute_id, idempotency_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ruling_current ON evidence_dispute_rulings(dispute_id) WHERE is_current=1;
+CREATE INDEX IF NOT EXISTS idx_ruling_dispute ON evidence_dispute_rulings(dispute_id,id);
 CREATE TABLE IF NOT EXISTS public_feedback (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     product_id INTEGER NOT NULL REFERENCES health_products(id) ON DELETE CASCADE,
@@ -195,6 +246,7 @@ CREATE TABLE IF NOT EXISTS pilot_protocols (
     code TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     capability TEXT NOT NULL,
+    product_code TEXT,
     version INTEGER NOT NULL DEFAULT 1,
     parameter_schema_json TEXT NOT NULL,
     default_parameters_json TEXT NOT NULL DEFAULT '{}',
@@ -235,6 +287,7 @@ CREATE TABLE IF NOT EXISTS pilot_sessions (
     current_observation_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
+    evidence_snapshot_json TEXT,
     version INTEGER NOT NULL DEFAULT 1,
     started_at TEXT,
     finished_at TEXT,
@@ -279,6 +332,7 @@ PERMISSIONS = [
     ("catalog.read", "查看健康创新目录", "catalog", "read"),
     ("catalog.write", "维护健康创新目录", "catalog", "write"),
     ("evidence.review", "审阅产品证据", "evidence", "review"),
+    ("evidence.dispute", "裁决证据争议", "evidence", "dispute"),
     ("feedback.read", "查看体验反馈", "feedback", "read"),
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
@@ -330,11 +384,77 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate(connection: sqlite3.Connection, now: str) -> None:
+    """对已存在的数据库补齐新表与新列；全新数据库由 SCHEMA 直接建立。"""
+    del now
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0] or 0)
+    if version < 3:
+        definition = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='evidence_documents'"
+        ).fetchone()
+        definition_sql = definition["sql"] if definition is not None else ""
+        if definition_sql and "disputed" not in definition_sql:
+            # 旧表 status 的 CHECK 不含 disputed，需要重建以放宽约束并补入结论列
+            connection.execute(
+                "CREATE TABLE evidence_documents_new ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "product_id INTEGER NOT NULL REFERENCES health_products(id) ON DELETE CASCADE,"
+                "evidence_type TEXT NOT NULL CHECK(evidence_type IN ('临床','性能','安全','合规','体验')),"
+                "title TEXT NOT NULL,source_name TEXT NOT NULL,source_region TEXT NOT NULL,"
+                "version TEXT NOT NULL,content_digest TEXT NOT NULL,"
+                "summary_json TEXT NOT NULL DEFAULT '{}',"
+                "status TEXT NOT NULL DEFAULT 'submitted' CHECK(status IN ('submitted','accepted','rejected','superseded','disputed')),"
+                "submitted_by TEXT NOT NULL,submitted_at TEXT NOT NULL,reviewed_by TEXT,reviewed_at TEXT,"
+                "claim_use TEXT,claim_metric TEXT,claim_population TEXT,"
+                "claim_conclusion TEXT CHECK(claim_conclusion IS NULL OR claim_conclusion IN ('supports','concern')),"
+                "claim_scope_key TEXT,"
+                "UNIQUE(product_id, evidence_type, version, content_digest))"
+            )
+            connection.execute(
+                "INSERT INTO evidence_documents_new(id,product_id,evidence_type,title,source_name,source_region,"
+                "version,content_digest,summary_json,status,submitted_by,submitted_at,reviewed_by,reviewed_at) "
+                "SELECT id,product_id,evidence_type,title,source_name,source_region,version,content_digest,"
+                "summary_json,status,submitted_by,submitted_at,reviewed_by,reviewed_at FROM evidence_documents"
+            )
+            connection.execute("DROP TABLE evidence_documents")
+            connection.execute("ALTER TABLE evidence_documents_new RENAME TO evidence_documents")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_evidence_claim_scope ON evidence_documents(product_id,claim_scope_key) "
+                "WHERE claim_scope_key IS NOT NULL"
+            )
+        else:
+            evidence_columns = _column_names(connection, "evidence_documents")
+            for column, declaration in (
+                ("claim_use", "claim_use TEXT"),
+                ("claim_metric", "claim_metric TEXT"),
+                ("claim_population", "claim_population TEXT"),
+                ("claim_conclusion", "claim_conclusion TEXT"),
+                ("claim_scope_key", "claim_scope_key TEXT"),
+            ):
+                if column not in evidence_columns:
+                    connection.execute(f"ALTER TABLE evidence_documents ADD COLUMN {declaration}")
+        protocol_columns = _column_names(connection, "pilot_protocols")
+        if "product_code" not in protocol_columns:
+            connection.execute("ALTER TABLE pilot_protocols ADD COLUMN product_code TEXT")
+        session_columns = _column_names(connection, "pilot_sessions")
+        if "evidence_snapshot_json" not in session_columns:
+            connection.execute("ALTER TABLE pilot_sessions ADD COLUMN evidence_snapshot_json TEXT")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_evidence_claim_scope ON evidence_documents(product_id,claim_scope_key) "
+        "WHERE claim_scope_key IS NOT NULL"
+    )
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
+        _migrate(connection, now)
+        connection.execute("PRAGMA user_version=3")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.core.errors import NotFoundError, ValidationError
+from app.catalog.disputes import DisputeService
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +40,8 @@ class CatalogInsights:
             raise NotFoundError("健康创新产品不存在")
         accepted = [dict(row) for row in self.connection.execute(
             "SELECT evidence_type,source_region,version,reviewed_at FROM evidence_documents "
-            "WHERE product_id=? AND status='accepted' ORDER BY evidence_type,reviewed_at,id",
+            "WHERE product_id=? AND status='accepted' AND (claim_conclusion IS NULL OR claim_conclusion='supports') "
+            "ORDER BY evidence_type,reviewed_at,id",
             (product["id"],),
         ).fetchall()]
         feedback = self.connection.execute(
@@ -65,7 +67,10 @@ class CatalogInsights:
             blockers.append(f"已接受证据少于 {rule.minimum_accepted} 份")
         if not feedback_ready:
             blockers.append(f"有效体验反馈少于 {rule.minimum_feedback} 条")
-        ready = bool(product["active"]) and product["regulatory_status"] != "暂停" and evidence_ready and feedback_ready
+        gate = DisputeService(self.connection).product_evidence_gate(product["id"])
+        if gate is not None:
+            blockers.append(gate["reason"] + (f"（争议 {gate['dispute_code']}）" if gate.get("dispute_code") else ""))
+        ready = bool(product["active"]) and product["regulatory_status"] != "暂停" and evidence_ready and feedback_ready and gate is None
         return {
             "product_code": product["code"],
             "product_name": product["name"],
@@ -77,6 +82,7 @@ class CatalogInsights:
             "feedback_count": feedback_amount,
             "average_rating": round(float(feedback["average_rating"]), 2) if feedback["average_rating"] is not None else None,
             "follow_up_count": int(feedback["follow_up"] or 0),
+            "evidence_gate": gate,
             "ready_for_expansion": ready,
             "blockers": blockers,
         }

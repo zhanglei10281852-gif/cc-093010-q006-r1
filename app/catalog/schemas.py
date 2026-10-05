@@ -41,6 +41,13 @@ class SiteUpdate(BaseModel):
     status: Literal["active", "suspended", "closed"] | None = None
 
 
+class EvidenceClaim(BaseModel):
+    use: str = Field(min_length=2, max_length=300, description="预期用途/使用场景")
+    metric: str = Field(min_length=1, max_length=160, description="评价指标，如灵敏度、误报率")
+    population: str = Field(min_length=2, max_length=300, description="适用人群/样本类型")
+    conclusion: Literal["supports", "concern"]
+
+
 class EvidenceSubmit(BaseModel):
     product_code: str = Field(min_length=2, max_length=64)
     evidence_type: Literal["临床", "性能", "安全", "合规", "体验"]
@@ -51,12 +58,49 @@ class EvidenceSubmit(BaseModel):
     content_digest: str = Field(min_length=16, max_length=128)
     summary: dict = Field(default_factory=dict)
     submitted_by: str = Field(min_length=1, max_length=120)
+    claim: EvidenceClaim | None = None
 
 
 class EvidenceReview(BaseModel):
     reviewer: str = Field(min_length=1, max_length=120)
     decision: Literal["accepted", "rejected"]
     note: str = Field(default="", max_length=2000)
+
+
+class DisputeOpen(BaseModel):
+    product_code: str = Field(min_length=2, max_length=64)
+    use: str = Field(min_length=2, max_length=300)
+    metric: str = Field(min_length=1, max_length=160)
+    population: str = Field(min_length=2, max_length=300)
+    evidence_ids: list[int] | None = Field(default=None, max_length=200)
+    opened_by: str = Field(min_length=1, max_length=120)
+    dedupe_key: str | None = Field(default=None, max_length=160)
+
+
+class DisputeAddMaterial(BaseModel):
+    evidence_id: int
+    actor: str = Field(min_length=1, max_length=120)
+
+
+class DisputeRuling(BaseModel):
+    adjudicator: str = Field(min_length=1, max_length=120)
+    decision: Literal["prefer_supports", "prefer_concern", "inconclusive", "restricted_use"]
+    comparison_basis: str = Field(min_length=10, max_length=4000, description="比较依据：样本量、方法学、地区差异等")
+    applicable_scope: dict = Field(default_factory=dict, description="裁决适用范围，如地区、样本类型")
+    interim_restrictions: list[str] = Field(default_factory=list, max_length=50, description="临时使用限制")
+    idempotency_key: str | None = Field(default=None, max_length=160)
+
+    @model_validator(mode="after")
+    def require_restrictions_for_restricted_use(self) -> "DisputeRuling":
+        if self.decision == "restricted_use" and not any(item.strip() for item in self.interim_restrictions):
+            raise ValueError("裁决为受限使用时必须记录至少一条临时限制")
+        return self
+
+
+class DisputeReopen(BaseModel):
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=5, max_length=2000, description="补充材料或重开原因")
+    evidence_ids: list[int] | None = Field(default=None, max_length=200)
 
 
 class FeedbackSubmit(BaseModel):

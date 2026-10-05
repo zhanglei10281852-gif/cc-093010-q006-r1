@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from app.catalog.schemas import EvidenceReview, EvidenceSubmit, FeedbackSubmit, ProductCreate, ProductUpdate, SiteCreate, SiteUpdate
+from app.catalog.schemas import DisputeAddMaterial, DisputeOpen, DisputeReopen, DisputeRuling, EvidenceReview, EvidenceSubmit, FeedbackSubmit, ProductCreate, ProductUpdate, SiteCreate, SiteUpdate
+from app.catalog.disputes import DisputeService
 from app.catalog.insights import CatalogInsights
 from app.catalog.service import CatalogService
 from app.database import get_connection
@@ -58,6 +59,41 @@ def review_evidence(evidence_id: int, payload: EvidenceReview):
 @router.get("/evidence")
 def list_evidence(product_code: str | None = None, status: str | None = None):
     return {"items": service().list_evidence(product_code, status)}
+
+
+@router.post("/disputes", status_code=201)
+def open_dispute(payload: DisputeOpen):
+    return DisputeService().open_dispute(payload.model_dump())
+
+
+@router.get("/disputes")
+def list_disputes(product_code: str | None = None, status: str | None = None):
+    return {"items": DisputeService().list_disputes(product_code, status)}
+
+
+@router.get("/disputes/{dispute_id}")
+def get_dispute(dispute_id: int):
+    return DisputeService().get_dispute(dispute_id)
+
+
+@router.post("/disputes/{dispute_id}/materials")
+def add_dispute_material(dispute_id: int, payload: DisputeAddMaterial):
+    return DisputeService().add_material(dispute_id, payload.model_dump())
+
+
+@router.post("/disputes/{dispute_id}/rulings")
+def rule_dispute(dispute_id: int, payload: DisputeRuling):
+    return DisputeService().rule(dispute_id, payload.model_dump())
+
+
+@router.post("/disputes/{dispute_id}/reopen")
+def reopen_dispute(dispute_id: int, payload: DisputeReopen):
+    return DisputeService().reopen(dispute_id, payload.model_dump())
+
+
+@router.get("/evidence-overview/{product_code}")
+def evidence_overview(product_code: str):
+    return DisputeService().overview(product_code)
 
 
 @router.post("/feedback", status_code=201)

@@ -7,6 +7,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
 from app.pilots.repository import PilotRepository
+from app.catalog.disputes import DisputeService
+from app.catalog.repository import CatalogRepository
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.database import get_connection, transaction
@@ -35,8 +37,17 @@ class PilotOperationsService:
             repository = PilotRepository(connection)
             if repository.protocol_by_code(payload["code"]):
                 raise ConflictError("参数方案编码已存在")
+            product_code = payload.get("product_code")
+            if product_code:
+                product = CatalogRepository(connection).product_by_code(product_code)
+                if product is None:
+                    raise NotFoundError("绑定的健康创新产品不存在")
+                block = DisputeService(connection, self.clock).product_evidence_gate(product["id"])
+                if block is not None:
+                    raise ConflictError("产品证据存在未决争议或受限裁决，暂不能支撑新的试点方案", context=block)
             return repository.create_protocol(
                 code=payload["code"], name=payload["name"], capability=payload["capability"],
+                product_code=product_code,
                 parameter_schema=payload["parameter_schema"], defaults=payload["default_parameters"],
                 max_runtime_seconds=payload["max_runtime_seconds"], max_attempts=payload["max_attempts"],
                 created_by=actor, now=now,
@@ -63,11 +74,20 @@ class PilotOperationsService:
                     raise ConflictError("同一幂等键对应了不同的试点参数")
                 return dict(repository.session_by_id(existing["id"]))
             self._check_quota(repository, payload["requested_by"], now_value)
+            evidence_snapshot = None
+            if protocol["product_code"]:
+                product = CatalogRepository(connection).product_by_code(protocol["product_code"])
+                if product is not None:
+                    gate = DisputeService(connection, self.clock).product_evidence_gate(product["id"])
+                    if gate is not None:
+                        raise ConflictError("产品证据存在未决争议或受限裁决，暂不能支撑新的试点场次", context=gate)
+                    evidence_snapshot = DisputeService(connection, self.clock).session_evidence_snapshot(product["id"])
             return repository.create_session(
                 protocol_id=protocol["id"], project_code=payload["project_code"],
                 requested_by=payload["requested_by"], parameters=parameters,
                 parameter_digest=parameter_digest, priority=payload["priority"],
-                idempotency_key=payload["idempotency_key"], max_attempts=protocol["max_attempts"], now=now,
+                idempotency_key=payload["idempotency_key"], max_attempts=protocol["max_attempts"],
+                evidence_snapshot=evidence_snapshot, now=now,
             )
 
     def list_sessions(self, *, status: str | None = None, project_code: str | None = None, requested_by: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
@@ -78,6 +98,8 @@ class PilotOperationsService:
         if row is None:
             raise NotFoundError("试点体验场次不存在")
         observation = dict(row)
+        raw_snapshot = observation.pop("evidence_snapshot_json", None)
+        observation["evidence_snapshot"] = json.loads(raw_snapshot) if raw_snapshot else None
         observation["observations"] = self.repository.observation_versions(session_id)
         observation["interventions"] = self.repository.interventions(session_id)
         return observation
