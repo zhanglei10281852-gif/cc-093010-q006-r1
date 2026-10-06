@@ -168,7 +168,8 @@ CREATE TABLE IF NOT EXISTS evidence_documents (
     version TEXT NOT NULL,
     content_digest TEXT NOT NULL,
     summary_json TEXT NOT NULL DEFAULT '{}',
-    status TEXT NOT NULL DEFAULT 'submitted' CHECK(status IN ('submitted','accepted','rejected','superseded')),
+    status TEXT NOT NULL DEFAULT 'submitted' CHECK(status IN ('submitted','accepted','rejected','superseded','disputed')),
+    dispute_id INTEGER,
     submitted_by TEXT NOT NULL,
     submitted_at TEXT NOT NULL,
     reviewed_by TEXT,
@@ -200,6 +201,7 @@ CREATE TABLE IF NOT EXISTS pilot_protocols (
     default_parameters_json TEXT NOT NULL DEFAULT '{}',
     max_runtime_seconds INTEGER NOT NULL CHECK(max_runtime_seconds > 0),
     max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
+    product_code TEXT NOT NULL DEFAULT '',
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -235,6 +237,7 @@ CREATE TABLE IF NOT EXISTS pilot_sessions (
     current_observation_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
+    evidence_basis_json TEXT NOT NULL DEFAULT '[]',
     version INTEGER NOT NULL DEFAULT 1,
     started_at TEXT,
     finished_at TEXT,
@@ -266,7 +269,61 @@ CREATE TABLE IF NOT EXISTS pilot_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pilot_interventions ON pilot_interventions(session_id,id);
+
+CREATE TABLE IF NOT EXISTS disputes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    product_id INTEGER NOT NULL REFERENCES health_products(id) ON DELETE CASCADE,
+    intended_use TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    population TEXT NOT NULL,
+    scope_digest TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','ruled','superseded')),
+    raised_by TEXT NOT NULL,
+    raised_at TEXT NOT NULL,
+    closed_at TEXT,
+    current_ruling_id INTEGER,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_disputes_product ON disputes(product_id,status);
+CREATE INDEX IF NOT EXISTS idx_disputes_scope ON disputes(product_id,scope_digest,status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_disputes_one_active_per_scope
+    ON disputes(product_id,scope_digest) WHERE status<>'superseded';
+CREATE TABLE IF NOT EXISTS dispute_rulings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dispute_id INTEGER NOT NULL REFERENCES disputes(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    arbiter TEXT NOT NULL,
+    comparison_basis TEXT NOT NULL,
+    applicable_scope TEXT NOT NULL,
+    interim_restrictions_json TEXT NOT NULL DEFAULT '[]',
+    basis_evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+    dispositions_json TEXT NOT NULL DEFAULT '[]',
+    based_on_version INTEGER NOT NULL DEFAULT 0,
+    rationale TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(dispute_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_dispute_rulings_dispute ON dispute_rulings(dispute_id,version);
+CREATE TABLE IF NOT EXISTS dispute_supplements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dispute_id INTEGER NOT NULL REFERENCES disputes(id) ON DELETE CASCADE,
+    evidence_id INTEGER NOT NULL REFERENCES evidence_documents(id) ON DELETE CASCADE,
+    added_by TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(dispute_id, evidence_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dispute_supplements_dispute ON dispute_supplements(dispute_id,id);
 '''
+
+
+# 既有数据库升级到争议域所需的补充列：表名 -> (列名, 列定义)
+MIGRATION_COLUMNS: dict[str, list[tuple[str, str]]] = {
+    "evidence_documents": [("dispute_id", "INTEGER")],
+    "pilot_protocols": [("product_code", "TEXT NOT NULL DEFAULT ''")],
+    "pilot_sessions": [("evidence_basis_json", "TEXT NOT NULL DEFAULT '[]'")],
+}
 
 
 PERMISSIONS = [
@@ -279,6 +336,8 @@ PERMISSIONS = [
     ("catalog.read", "查看健康创新目录", "catalog", "read"),
     ("catalog.write", "维护健康创新目录", "catalog", "write"),
     ("evidence.review", "审阅产品证据", "evidence", "review"),
+    ("dispute.read", "查看证据争议", "dispute", "read"),
+    ("dispute.adjudicate", "裁决证据争议", "dispute", "adjudicate"),
     ("feedback.read", "查看体验反馈", "feedback", "read"),
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
@@ -334,7 +393,8 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
+        _apply_column_migrations(connection)
+        connection.execute("PRAGMA user_version=3")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -356,6 +416,14 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
         )
+
+
+def _apply_column_migrations(connection: sqlite3.Connection) -> None:
+    for table, columns in MIGRATION_COLUMNS.items():
+        existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+        for column, definition in columns:
+            if column not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def migrate_db() -> None:

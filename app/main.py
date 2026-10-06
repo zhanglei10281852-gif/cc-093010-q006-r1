@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app.api import audit, auth, departments_admin, maintenance, roles, system, users
 from app.catalog.router import router as catalog_router
+from app.disputes.router import router as dispute_router
 from app.core.errors import DomainError
 from app.database import close_connection, init_db
 from app.pilots.router import router as pilot_router
@@ -20,7 +21,7 @@ async def lifespan(app: FastAPI):
     close_connection()
 
 
-app = FastAPI(title="全球健康创新试点运营服务", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="全球健康创新试点运营服务", version="3.0.0", lifespan=lifespan)
 
 
 @app.exception_handler(DomainError)
@@ -40,6 +41,7 @@ app.include_router(system.router)
 app.include_router(departments_admin.router)
 app.include_router(maintenance.router)
 app.include_router(catalog_router)
+app.include_router(dispute_router)
 app.include_router(pilot_router)
 
 

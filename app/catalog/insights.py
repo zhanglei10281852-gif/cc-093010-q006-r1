@@ -55,17 +55,23 @@ class CatalogInsights:
         feedback_amount = int(feedback["amount"] or 0)
         feedback_ready = feedback_amount >= rule.minimum_feedback
         blockers: list[str] = []
+        open_disputes = [dict(row) for row in self.connection.execute(
+            "SELECT code,metric,population FROM disputes WHERE product_id=? AND status='open' ORDER BY id",
+            (product["id"],),
+        ).fetchall()]
         if not product["active"]:
             blockers.append("产品已停用")
         if product["regulatory_status"] == "暂停":
             blockers.append("产品处于暂停状态")
+        for dispute in open_disputes:
+            blockers.append(f"存在未决证据争议 {dispute['code']}（{dispute['metric']} / {dispute['population']}）")
         if missing_types:
             blockers.append("缺少已接受证据：" + "、".join(missing_types))
         if len(accepted) < rule.minimum_accepted:
             blockers.append(f"已接受证据少于 {rule.minimum_accepted} 份")
         if not feedback_ready:
             blockers.append(f"有效体验反馈少于 {rule.minimum_feedback} 条")
-        ready = bool(product["active"]) and product["regulatory_status"] != "暂停" and evidence_ready and feedback_ready
+        ready = bool(product["active"]) and product["regulatory_status"] != "暂停" and evidence_ready and feedback_ready and not open_disputes
         return {
             "product_code": product["code"],
             "product_name": product["name"],

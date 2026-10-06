@@ -35,11 +35,17 @@ class PilotOperationsService:
             repository = PilotRepository(connection)
             if repository.protocol_by_code(payload["code"]):
                 raise ConflictError("参数方案编码已存在")
+            product_code = (payload.get("product_code") or "").strip().lower()
+            if product_code:
+                from app.catalog.repository import CatalogRepository
+
+                if CatalogRepository(connection).product_by_code(product_code) is None:
+                    raise NotFoundError("参数方案绑定的健康创新产品不存在")
             return repository.create_protocol(
                 code=payload["code"], name=payload["name"], capability=payload["capability"],
                 parameter_schema=payload["parameter_schema"], defaults=payload["default_parameters"],
                 max_runtime_seconds=payload["max_runtime_seconds"], max_attempts=payload["max_attempts"],
-                created_by=actor, now=now,
+                created_by=actor, now=now, product_code=product_code,
             )
 
     def set_quota(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
@@ -63,12 +69,35 @@ class PilotOperationsService:
                     raise ConflictError("同一幂等键对应了不同的试点参数")
                 return dict(repository.session_by_id(existing["id"]))
             self._check_quota(repository, payload["requested_by"], now_value)
+            # 被争议覆盖的材料不能支撑新场次；命中裁决受限场景同样拒绝
+            evidence_basis = self._evidence_gate(repository, protocol, parameters)
             return repository.create_session(
                 protocol_id=protocol["id"], project_code=payload["project_code"],
                 requested_by=payload["requested_by"], parameters=parameters,
                 parameter_digest=parameter_digest, priority=payload["priority"],
                 idempotency_key=payload["idempotency_key"], max_attempts=protocol["max_attempts"], now=now,
+                evidence_basis=evidence_basis,
             )
+
+    @staticmethod
+    def _evidence_gate(repository: PilotRepository, protocol: sqlite3.Row, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        """绑定产品的方案在提交时通过证据争议门禁，并固化当时采用的证据判断。"""
+        product_code = str(protocol["product_code"] or "").strip()
+        if not product_code:
+            return []
+        # 延迟导入避免 pilots 与 disputes 顶层循环依赖
+        from app.disputes.service import DisputeService
+
+        gate = DisputeService(repository.connection).evidence_gate(product_code, parameters)
+        return [
+            {
+                "snapshot_at": gate["snapshot_at"],
+                "product_code": product_code,
+                "available_evidence": gate["available_evidence"],
+                "restricted_scenes": gate["restricted_scenes"],
+                "disputes": gate["disputes"],
+            }
+        ]
 
     def list_sessions(self, *, status: str | None = None, project_code: str | None = None, requested_by: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         return self.repository.list_sessions(status=status, project_code=project_code, requested_by=requested_by, limit=max(1, min(limit, 500)))
@@ -80,6 +109,10 @@ class PilotOperationsService:
         observation = dict(row)
         observation["observations"] = self.repository.observation_versions(session_id)
         observation["interventions"] = self.repository.interventions(session_id)
+        try:
+            observation["evidence_basis"] = json.loads(observation.get("evidence_basis_json") or "[]")
+        except (TypeError, ValueError):
+            observation["evidence_basis"] = []
         return observation
 
     def claim(self, site_code: str, capabilities: list[str], lease_seconds: int) -> dict[str, Any] | None:

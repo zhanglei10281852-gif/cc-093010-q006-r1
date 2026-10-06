@@ -81,6 +81,7 @@ def pilot_demo() -> int:
                 "default_parameters": {},
                 "max_runtime_seconds": 1800,
                 "max_attempts": 2,
+                "product_code": "exoskeleton-a",
             })
             submitted = client.post("/api/pilots/sessions", json={
                 "protocol_code": "gait-assist",

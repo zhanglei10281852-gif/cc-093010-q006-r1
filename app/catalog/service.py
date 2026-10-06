@@ -70,6 +70,8 @@ class CatalogService:
         evidence = self.repository.evidence_by_id(evidence_id)
         if evidence is None:
             raise NotFoundError("证据材料不存在")
+        if evidence["status"] == "disputed":
+            raise ConflictError("材料已被证据争议冻结，逐份审阅结论无效，请在争议裁决中处置")
         if evidence["status"] != "submitted":
             raise ConflictError("只有待审阅材料可以作出决定")
         if decision == "rejected" and len(note.strip()) < 4:

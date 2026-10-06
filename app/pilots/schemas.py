@@ -13,6 +13,7 @@ class ProtocolCreate(BaseModel):
     default_parameters: dict[str, Any] = Field(default_factory=dict)
     max_runtime_seconds: int = Field(default=600, ge=1, le=86400)
     max_attempts: int = Field(default=3, ge=1, le=20)
+    product_code: str | None = Field(default=None, max_length=64, description="绑定产品时，场次提交需通过证据争议门禁")
 
 
 class QuotaSet(BaseModel):
